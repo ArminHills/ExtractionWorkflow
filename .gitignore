@@ -1,0 +1,7 @@
+.venv
+.git
+.env
+*.tmp
+log_*.txt
+*.log
+
