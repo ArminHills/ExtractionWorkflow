@@ -1,0 +1,4 @@
+pypdf
+python-docx
+python-dotenv
+google-genai

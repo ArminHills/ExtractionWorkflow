@@ -4,4 +4,6 @@
 *.tmp
 log_*.txt
 *.log
+temp*
+tmp*
 

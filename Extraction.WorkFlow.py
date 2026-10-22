@@ -1,27 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-استخراج خودکار سوالات از PDF با استفاده از Gemini (نسخه بازنویسی‌شده)
-======================================================================
-تغییرات اصلی نسبت به نسخه قبلی:
-  1. کتابخانه قدیمی و منسوخ‌شده google-generativeai حذف و با کتابخانه
-     جدید و رسمی google-genai جایگزین شد (علت اصلی خطای 403 روی
-     آدرس discovery همین کتابخانه قدیمی بود).
-  2. مدل gemini-1.5-flash (که کاملاً از رده خارج شده و هر درخواستی به
-     آن خطای 404 می‌دهد) با gemini-3.1-flash-lite (نسخه فعلی و پایدار
-     flash-lite) جایگزین شد.
-  3. کلید API دیگر داخل کد نوشته نمی‌شود؛ از فایل .env یا متغیر محیطی
-     خوانده می‌شود (به بخش امنیتی در پیام همراه این فایل مراجعه کنید).
-  4. هر صفحه پی‌دی‌اف مستقیماً و به‌صورت inline به مدل ارسال می‌شود
-     (بدون آپلود/پولینگ روی سرور گوگل)، مگر این‌که فایل بزرگ باشد.
-  5. رابط کاربری گرافیکی کامل با نوار پیشرفت و لاگ زنده.
-  6. قابلیت ادامه (Resume): اگر برنامه وسط کار متوقف شود، در اجرای
-     بعدی فقط صفحات باقی‌مانده پردازش می‌شوند.
-  7. ذخیره خودکار فایل Word پس از هر صفحه (از دست رفتن اطلاعات در صورت
-     قطع برنامه را از بین می‌برد).
-  8. دسته‌بندی هوشمند خطاها (خطای کلید/مدل بلافاصله متوقف می‌شود، خطای
-     محدودیت نرخ با backoff نمایی دوباره امتحان می‌شود).
-"""
-
 import os
 import re
 import sys
@@ -47,6 +24,8 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
+import argparse
+from getpass import getpass
 
 # ==============================================================================
 # تنظیمات قابل ویرایش
@@ -618,6 +597,144 @@ def main():
     ExtractionApp(root)
     root.mainloop()
 
+
+def _cli_log(msg):
+    print(msg, flush=True)
+ 
+ 
+def _cli_progress(done, total):
+    print(f"[PROGRESS] {done}/{total} pages", flush=True)
+ 
+ 
+def _cli_get_api_key():
+    """Read GEMINI_API_KEY from the environment / .env; fall back to a hidden prompt."""
+    load_dotenv(ENV_PATH)
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    if not sys.stdin.isatty():
+        return None
+ 
+    key = getpass("Gemini API key (input hidden): ").strip()
+    if not key:
+        return None
+    if input("Save it to the .env file next to the script? [y/N]: ").strip().lower() == "y":
+        try:
+            if not ENV_PATH.exists():
+                ENV_PATH.touch()
+            set_key(str(ENV_PATH), "GEMINI_API_KEY", key)
+        except Exception as e:
+            print(f"[WARN] Could not save the key to .env: {e}")
+    os.environ["GEMINI_API_KEY"] = key
+    return key
+ 
+ 
+def build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog=os.path.basename(sys.argv[0]),
+        description=("Extract questions from PDF pages with Gemini and save them to a Word file. "
+                     "Run with no arguments to open the GUI instead."),
+        epilog=('example:\n'
+                '  python %(prog)s -n Bio10.3 -i book.pdf -p "250-255, 260, 270-275" -o D:\\Projects\n\n'
+                'The API key is read from the GEMINI_API_KEY environment variable or the .env file.\n'
+                'Press Ctrl+C once to stop after the current page.'),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-n", "--name", required=True, metavar="NAME",
+                        help="project name (used for the output folder and the .docx file name)")
+    parser.add_argument("-i", "--pdf", required=True, metavar="FILE",
+                        help="path to the source PDF file")
+    parser.add_argument("-p", "--pages", required=True, metavar="RANGE",
+                        help='pages to extract, e.g. "250-255, 260, 270-275"')
+    parser.add_argument("-o", "--output-dir", required=True, metavar="DIR",
+                        help="directory where the project folder will be created")
+    parser.add_argument("-m", "--model", default=MODEL_NAME_DEFAULT, metavar="MODEL",
+                        help="Gemini model name (default: %(default)s)")
+    parser.add_argument("--restart", action="store_true",
+                        help="rebuild the Word file from scratch if it already exists "
+                             "(default: resume and process only the remaining pages)")
+    return parser
+ 
+ 
+def main_cli(argv=None):
+    # Keep Persian log lines from crashing on consoles with a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+ 
+    parser = build_cli_parser()
+    args = parser.parse_args(argv)
+ 
+    base_name = args.name.strip()
+    if not os.path.isfile(args.pdf):
+        parser.error(f"PDF file not found: {args.pdf}")
+    if not is_valid_name_component(base_name):
+        parser.error('invalid project name (must not contain  < > : " / \\ | ? *)')
+    if not os.path.isdir(args.output_dir):
+        parser.error(f"output directory does not exist: {args.output_dir}")
+    try:
+        pages = parse_pages_input(args.pages)
+    except Exception:
+        parser.error('invalid page range. Example: "250-255, 260, 270-275"')
+ 
+    project_folder = os.path.join(args.output_dir, base_name)
+    word_path = os.path.join(project_folder, f"{base_name}.docx")
+    word_exists = os.path.exists(word_path)
+    resume = word_exists and not args.restart
+    if resume:
+        _cli_log(f"[INFO] {base_name}.docx already exists — resuming (use --restart to rebuild).")
+    elif word_exists:
+        _cli_log(f"[INFO] --restart given — {base_name}.docx will be rebuilt from scratch.")
+ 
+    api_key = _cli_get_api_key()
+    if not api_key:
+        print("[FATAL] No API key found. Set GEMINI_API_KEY (environment variable or .env file).",
+              file=sys.stderr)
+        return 1
+ 
+    params = dict(pdf_path=args.pdf, base_name=base_name, pages=pages, output_dir=args.output_dir,
+                  model_name=args.model.strip() or MODEL_NAME_DEFAULT, api_key=api_key, resume=resume)
+ 
+    stop_event = threading.Event()
+    result = {"ok": False, "word_path": word_path}
+ 
+    def worker():
+        nonlocal result
+        try:
+            result = process_workflow(params, log_fn=_cli_log, progress_fn=_cli_progress,
+                                      stop_event=stop_event)
+        except Exception:
+            _cli_log(f"[FATAL] Unexpected error:\n{traceback.format_exc()}")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        while t.is_alive():
+            t.join(0.2)
+    except KeyboardInterrupt:
+        stop_event.set()
+        _cli_log("\n[INFO] Stop requested — finishing the current page (Ctrl+C again to force quit)...")
+        try:
+            while t.is_alive():
+                t.join(0.2)
+        except KeyboardInterrupt:
+            _cli_log("[WARN] Forced exit.")
+            return 130
+ 
+    if result.get("ok"):
+        _cli_log(f"[DONE] Finished. Word file: {result.get('word_path')}")
+        return 0
+    _cli_log("[DONE] Finished with errors or was stopped. "
+             f"See the log above. Word file: {result.get('word_path')}")
+    return 1
+ 
+ 
+# With arguments -> run the CLI and exit before the GUI block below is reached.
+# Without arguments -> falls through to the original `main()` (GUI).
+if __name__ == "__main__" and len(sys.argv) > 1:
+    sys.exit(main_cli())
 
 if __name__ == "__main__":
     main()
